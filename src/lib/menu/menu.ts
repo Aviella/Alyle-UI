@@ -17,7 +17,8 @@ import {
   ContentChildren,
   forwardRef,
   QueryList,
-  HostBinding
+  HostBinding,
+  AfterContentInit
   } from '@angular/core';
 import {
   LyOverlay,
@@ -35,7 +36,8 @@ import {
   lyl,
   ThemeRef,
   LyOverlayPosition,
-  StyleRenderer
+  StyleRenderer,
+  OverlayReference
   } from '@alyle/ui';
 import {
   trigger,
@@ -49,6 +51,11 @@ import { BooleanInput, coerceBooleanProperty } from '@angular/cdk/coercion';
 import { ViewportRuler } from '@angular/cdk/scrolling';
 import { Subject, asapScheduler } from 'rxjs';
 import { take, delay, debounceTime } from 'rxjs/operators';
+import { ESCAPE } from '@angular/cdk/keycodes';
+import { FocusKeyManager, FocusMonitor, FocusOrigin} from '@angular/cdk/a11y';
+
+/** Reason why the menu was closed. */
+export type MenuCloseReason = void | 'click' | 'keydown' | 'tab';
 
 export interface LyMenuTheme {
   /** Styles for Menu Component */
@@ -75,7 +82,7 @@ export const STYLES = (theme: ThemeVariables & LyMenuVariables, ref: ThemeRef) =
           : theme.menu.root(menu))
     ),
     container: lyl `{
-      background: ${theme.background.primary.default}
+      background: ${theme.paper.default}
       border-radius: 2px
       box-shadow: ${shadowBuilder(4)}
       display: block
@@ -146,8 +153,9 @@ const ANIMATIONS = [
     StyleRenderer
   ]
 })
-export class LyMenu implements OnChanges, OnInit, AfterViewInit, OnDestroy {
+export class LyMenu implements OnChanges, OnInit, AfterContentInit, AfterViewInit, OnDestroy {
 
+  private _keyManager: FocusKeyManager<LyMenuItem>;
   /** Menu Trigger */
   @Input()
   set ref(value: LyMenuTriggerFor) {
@@ -202,8 +210,13 @@ export class LyMenu implements OnChanges, OnInit, AfterViewInit, OnDestroy {
    * @docs-private
    */
   destroy: () => void;
+
   @ViewChild('container') _container?: ElementRef<HTMLDivElement>;
-  @ContentChildren(forwardRef(() => LyMenuItem)) readonly menuItems?: QueryList<LyMenuItem>;
+  /** All items inside the menu. Includes items nested inside another menu. */
+  @ContentChildren(forwardRef(() => LyMenuItem), {descendants: true}) readonly _allItems: QueryList<LyMenuItem>;
+  /** Only the direct descendant menu items. */
+  _directDescendantItems = new QueryList<LyMenuItem>();
+
   private _ref: LyMenuTriggerFor;
 
   /** The point in the anchor where the menu `xAxis` will be attached. */
@@ -236,6 +249,21 @@ export class LyMenu implements OnChanges, OnInit, AfterViewInit, OnDestroy {
    * @deprecated Use `yAxis` instead.
    */
   @Input() yPosition: YPosition;
+
+  @Input()
+  set flip(val: BooleanInput) {
+    const newValue = coerceBooleanProperty(val);
+    this._flip = newValue;
+  }
+  get flip(): boolean {
+    return this._flip;
+  }
+  private _flip = true;
+
+  /** Event emitted when the menu is closed. */
+  @Output() readonly closed: EventEmitter<MenuCloseReason> = new EventEmitter<MenuCloseReason>();
+
+
   private _hasBackdrop: boolean = true;
   private _mouseenterListen?: () => void;
   private _mouseleaveListen?: () => void;
@@ -255,6 +283,14 @@ export class LyMenu implements OnChanges, OnInit, AfterViewInit, OnDestroy {
     if (!this.ref) {
       throw new Error('LyMenu: require @Input() ref');
     }
+  }
+
+  ngAfterContentInit() {
+    this._keyManager = new FocusKeyManager(this._directDescendantItems)
+      .withWrap()
+      .withTypeAhead()
+      .withHomeAndEnd();
+    this._keyManager.tabOut.subscribe(() => this.closed.emit('tab'));
   }
 
   ngAfterViewInit() {
@@ -277,6 +313,7 @@ export class LyMenu implements OnChanges, OnInit, AfterViewInit, OnDestroy {
 
   ngOnDestroy() {
     this._removeOpenOnHoverListeners();
+    this._directDescendantItems.destroy();
   }
 
   private _checkBackdropAndOpenOnHover() {
@@ -348,12 +385,12 @@ export class LyMenu implements OnChanges, OnInit, AfterViewInit, OnDestroy {
           .setYAnchor(this.yAnchor)
           .setXAxis(this.xAxis)
           .setYAxis(this.yAxis)
-          .setFlip(true)
+          .setFlip(this.flip)
           .build()
         : new LyOverlayPosition(this._theme, this._viewportRuler, this.ref._getHostElement(), el)
           .setXAnchor(XPosition.after)
           .setYAnchor(YPosition.above)
-          .setFlip(true)
+          .setFlip(this.flip)
           .build();
 
     if (position instanceof Positioning) {
@@ -396,16 +433,33 @@ export class LyMenu implements OnChanges, OnInit, AfterViewInit, OnDestroy {
     '(mouseenter)': '_handleMouseEnter()'
   }
 })
-export class LyMenuItem {
+export class LyMenuItem implements OnDestroy {
+  private _itemSubMenuTrigger?: LyMenuTriggerFor;
+  /** Stream that emits when the menu item is focused. */
+  readonly _focused = new Subject<LyMenuItem>();
 
   constructor(
     @Optional() private _menu: LyMenu,
-    el: ElementRef,
-    renderer: Renderer2
+    private _el: ElementRef,
+    renderer: Renderer2,
+    private _focusMonitor: FocusMonitor,
   ) {
-    renderer.addClass(el.nativeElement, _menu.classes.item);
+    renderer.addClass(_el.nativeElement, _menu.classes.item);
   }
-  private _itemSubMenuTrigger?: LyMenuTriggerFor;
+
+  ngOnDestroy(): void {
+    this._focused.complete();
+  }
+  /** Focuses the menu item. */
+  focus(origin?: FocusOrigin, options?: FocusOptions): void {
+    if (this._focusMonitor && origin) {
+      this._focusMonitor.focusVia(this._getHostElement(), origin, options);
+    } else {
+      this._getHostElement().focus(options);
+    }
+
+    this._focused.next(this);
+  }
 
   _handleClick() {
     if (this._menu.ref && this._menu.ref._menuRef) {
@@ -440,7 +494,7 @@ export class LyMenuItem {
 
   /** Except for this, close all menus */
   private _closeOtherMenus() {
-    this._menu.menuItems!.forEach(menuItem => {
+    this._menu._allItems!.forEach(menuItem => {
       if (menuItem !== this) {
         menuItem._getItemSubMenuTrigger()?.closeMenu();
       }
@@ -453,6 +507,12 @@ export class LyMenuItem {
   _getItemSubMenuTrigger() {
     return this._itemSubMenuTrigger;
   }
+
+  /** Returns the host DOM element. */
+  _getHostElement(): HTMLElement {
+    return this._el.nativeElement;
+  }
+
 }
 
 
@@ -519,7 +579,7 @@ export class LyMenuTriggerFor implements OnDestroy {
   /** Opens the menu */
   openMenu() {
     if (!this._menuRef) {
-      this._menuRef = this.overlay.create(this.lyMenuTriggerFor, {
+      const overlayRef = this.overlay.create(this.lyMenuTriggerFor, {
         $implicit: this,
         data: this.menuData
       }, {
@@ -530,6 +590,14 @@ export class LyMenuTriggerFor implements OnDestroy {
         },
         fnDestroy: this.detach.bind(this),
         hasBackdrop: false
+      });
+      this._menuRef = overlayRef;
+      const keydownEvents = overlayRef.keydownEvents();
+      const keydownEventsSuscription = keydownEvents.subscribe((event) => {
+        if (event.keyCode === ESCAPE) {
+          this.closeMenu();
+          keydownEventsSuscription.unsubscribe();
+        }
       });
     }
   }
@@ -550,8 +618,9 @@ export class LyMenuTriggerFor implements OnDestroy {
 
   /** @docs-private */
   detach() {
-    if (this._menuRef) {
-      this._menuRef.detach();
+    const menuRef = this._menuRef;
+    if (menuRef) {
+      this._closeOverlay(menuRef);
       this._menuRef = null;
       this._destroying = true;
       this._menuDetached.next();
@@ -579,6 +648,13 @@ export class LyMenuTriggerFor implements OnDestroy {
    */
   _isItemSubMenuTrigger() {
     return !!this._menuItem;
+  }
+
+  private _closeOverlay(overlay?: OverlayReference | null) {
+    const overlayRef = overlay;
+    if (overlayRef && !overlay.isDestroyed) {
+      overlayRef.detach();
+    }
   }
 
 }
